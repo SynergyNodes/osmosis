@@ -1,9 +1,14 @@
 package cmd
 
 import (
+	"encoding/csv"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+
+	appparams "github.com/osmosis-labs/osmosis/v14/app/params"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -23,6 +28,7 @@ import (
 	"github.com/cosmos/cosmos-sdk/client/flags"
 	"github.com/cosmos/cosmos-sdk/client/keys"
 	"github.com/cosmos/cosmos-sdk/client/rpc"
+	"github.com/cosmos/cosmos-sdk/client/tx"
 	"github.com/cosmos/cosmos-sdk/codec"
 	"github.com/cosmos/cosmos-sdk/server"
 	serverconfig "github.com/cosmos/cosmos-sdk/server/config"
@@ -39,6 +45,8 @@ import (
 
 	"github.com/CosmWasm/wasmd/x/wasm"
 	wasmkeeper "github.com/CosmWasm/wasmd/x/wasm/keeper"
+
+	"github.com/cosmos/cosmos-sdk/types/bech32"
 
 	osmosis "github.com/osmosis-labs/osmosis/v14/app"
 )
@@ -225,6 +233,7 @@ func txCommand() *cobra.Command {
 		authcmd.GetBroadcastCommand(),
 		authcmd.GetEncodeCommand(),
 		authcmd.GetDecodeCommand(),
+		NewMultiSendCmd(),
 	)
 
 	osmosis.ModuleBasics.AddTxCommands(cmd)
@@ -304,4 +313,98 @@ func createOsmosisAppAndExport(
 	}
 
 	return app.ExportAppStateAndValidators(forZeroHeight, jailWhiteList, modulesToExport)
+}
+
+func parseCSV(path string) [][]string {
+	f, err := os.Open(path)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	csvReader := csv.NewReader(f)
+	records, err := csvReader.ReadAll()
+	if err != nil {
+		panic(err)
+	}
+
+	return records
+}
+
+// NewMultiSendCmd returns a CLI command for multi-send
+func NewMultiSendCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "multi-send [csv_file] [denom] [startIndex] [threshold]",
+		Short:   "Execute multisend based on csv file",
+		Example: `osmosisd tx multi-send "./airdrop.csv" acnto 0 100 --from=mykey --keyring-backend=test`,
+		Args:    cobra.ExactArgs(4),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clientCtx, err := client.GetClientTxContext(cmd)
+			if err != nil {
+				return err
+			}
+
+			sendMsgs := []banktypes.MsgSend{}
+			amountRecords := parseCSV(args[0])
+
+			for _, line := range amountRecords[1:] {
+				addr, amountStr := line[0], line[1]
+
+				_, bz, err := bech32.DecodeAndConvert(addr)
+				if err != nil {
+					return err
+				}
+
+				osmoAddr, err := bech32.ConvertAndEncode(appparams.Bech32PrefixAccAddr, bz)
+				if err != nil {
+					return err
+				}
+				amountDec := sdk.MustNewDecFromStr(amountStr)
+				decimalReduction := sdk.NewInt(1000_000_000).Mul(sdk.NewInt(1000_000_000)) // 10^18
+				amount := amountDec.Mul(sdk.NewDecFromBigInt(decimalReduction.BigInt())).TruncateInt()
+
+				msg := banktypes.MsgSend{
+					FromAddress: clientCtx.FromAddress.String(),
+					ToAddress:   osmoAddr,
+					Amount:      sdk.Coins{sdk.NewCoin(args[1], amount)},
+				}
+				sendMsgs = append(sendMsgs, msg)
+			}
+
+			startIndex, err := strconv.Atoi(args[2])
+			if err != nil {
+				return err
+			}
+			threshold, err := strconv.Atoi(args[3])
+			if err != nil {
+				return err
+			}
+
+			msgs := []sdk.Msg{}
+			for index, msg := range sendMsgs {
+				if index < startIndex {
+					continue
+				}
+				msgs = append(msgs, &banktypes.MsgSend{
+					FromAddress: msg.FromAddress,
+					ToAddress:   msg.ToAddress,
+					Amount:      msg.Amount,
+				})
+				if len(msgs) >= threshold || index+1 == len(sendMsgs) {
+					err := tx.GenerateOrBroadcastTxCLI(clientCtx, cmd.Flags(), msgs...)
+					if err != nil {
+						return err
+					}
+					fmt.Printf("executed batch %d/%d\n", index+1, len(sendMsgs))
+					msgs = []sdk.Msg{}
+				}
+			}
+			fmt.Println("finalized batch execution")
+
+			return nil
+		},
+	}
+
+	flags.AddTxFlagsToCmd(cmd)
+	return cmd
 }
